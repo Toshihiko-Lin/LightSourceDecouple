@@ -278,14 +278,55 @@ jobs:
     - name: Package Linux App
       if: matrix.platform == 'linux'
       run: |
-        cd dist
-        zip -r ${{ matrix.artifact_name }} DecoupleTool
+        # zip
+        cd dist && zip -r DecoupleTool-Linux-x64.zip DecoupleTool && cd ..
+
+        # AppImage
+        wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
+          -O /tmp/appimagetool
+        chmod +x /tmp/appimagetool
+
+        # Build AppDir: copy PyInstaller onedir output, then add AppImage metadata
+        mkdir -p AppDir
+        cp -r dist/DecoupleTool/. AppDir/
+
+        cat > AppDir/DecoupleTool.desktop << 'DESKTOP'
+        [Desktop Entry]
+        Name=DecoupleTool
+        Exec=DecoupleTool
+        Icon=DecoupleTool
+        Type=Application
+        Categories=Graphics;Photography;
+        DESKTOP
+
+        cp icon.png AppDir/DecoupleTool.png
+
+        cat > AppDir/AppRun << 'APPRUN'
+        #!/bin/bash
+        HERE=$(dirname "$(readlink -f "$0")")
+        exec "$HERE/DecoupleTool" "$@"
+        APPRUN
+        chmod +x AppDir/AppRun
+
+        # --appimage-extract-and-run avoids FUSE requirement on CI runners
+        ARCH=x86_64 /tmp/appimagetool --appimage-extract-and-run \
+          AppDir dist/DecoupleTool-Linux-x64.AppImage
 
     - name: Upload Artifact
+      if: matrix.platform != 'linux'
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
         path: dist/${{ matrix.artifact_name }}
+
+    - name: Upload Linux Artifacts
+      if: matrix.platform == 'linux'
+      uses: actions/upload-artifact@v4
+      with:
+        name: DecoupleTool-Linux-x64
+        path: |
+          dist/DecoupleTool-Linux-x64.zip
+          dist/DecoupleTool-Linux-x64.AppImage
 
   release:
     name: Publish v1.5 Release
@@ -303,7 +344,8 @@ jobs:
     - name: Gather release files
       run: |
         mkdir -p release-files
-        find release-assets -type f -name '*.zip' -exec cp {} release-files/ \;
+        find release-assets -type f \( -name '*.zip' -o -name '*.AppImage' \) \
+          -exec cp {} release-files/ \;
         ls -lh release-files
 
     - name: Create or update release
@@ -316,4 +358,5 @@ jobs:
           release-files/DecoupleTool-macOS-x64.zip
           release-files/DecoupleTool-Windows-x64.zip
           release-files/DecoupleTool-Linux-x64.zip
+          release-files/DecoupleTool-Linux-x64.AppImage
         generate_release_notes: true

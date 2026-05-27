@@ -351,6 +351,7 @@ class MainWindow(QMainWindow):
         self.combo_icc.addItems([
             "none",
             "ACESCG Linear",
+            "ProPhoto RGB Linear",
             "Kodak2383_Linear",
             "KodakEnduraPremier_Linear",
             CUSTOM_ICC_OPTION,

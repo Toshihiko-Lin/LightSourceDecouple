@@ -5,12 +5,10 @@ import tifffile
 
 from PySide6.QtCore import QThread, Signal
 
+from .calibration import get_calibration_matrix_path, validate_rgb_calibration_files
 from .icc import CUSTOM_ICC_OPTION, ICC_PROFILE_FILES
 from .paths import get_app_base_path
 from .raw_convert import (
-    IMAGE_EXTENSIONS,
-    RAW_EXTENSIONS,
-    TIFF_EXTENSIONS,
     convert_raws_to_tiffs,
     is_raw_path,
     output_tiff_name,
@@ -26,15 +24,21 @@ class ProcessingWorker(QThread):
     finished_error = Signal(str)         # 失败信号 (错误信息)
     request_confirmation = Signal(str, str) # 请求确认信号 (标题, 内容)
     
-    def __init__(self, dir_rgb, input_files, dir_output, dir_contactsheet, icc_mode="none", custom_icc_path="", use_cache_override=None):
+    def __init__(self, rgb_files, input_files, dir_output, dir_contactsheet, icc_mode="none", custom_icc_path="", use_cache_override=None, matrix_path=None, calibration_only=False, confirm_calibration=True):
         super().__init__()
-        self.dir_rgb = dir_rgb
+        if isinstance(rgb_files, (str, bytes, os.PathLike)):
+            self.rgb_files = [os.fspath(rgb_files)]
+        else:
+            self.rgb_files = list(rgb_files or [])
         self.input_files = input_files # 文件路径列表
         self.dir_output = dir_output
         self.dir_contactsheet = dir_contactsheet 
         self.icc_mode = icc_mode
         self.custom_icc_path = custom_icc_path
         self.use_cache_override = use_cache_override 
+        self.matrix_path = matrix_path or get_calibration_matrix_path()
+        self.calibration_only = calibration_only
+        self.confirm_calibration = confirm_calibration
         self._is_cancelled = False
         self._selected_icc_bytes = None
         self._temp_dirs = []
@@ -68,13 +72,12 @@ class ProcessingWorker(QThread):
             try:
                 # --- Step 1: 准备矩阵 ---
                 self.progress_updated.emit(0, "步骤 1/4: 准备校正矩阵...")
-                matrix_path = os.path.join(self.dir_rgb, "calibration_matrix.npy")
                 M_Final = None
 
                 # 1.1 检查缓存策略
-                if self.use_cache_override is True and os.path.exists(matrix_path):
+                if self.use_cache_override is True and self.matrix_path and os.path.exists(self.matrix_path):
                     try:
-                        M_Final = np.load(matrix_path)
+                        M_Final = np.load(self.matrix_path)
                     except Exception as e:
                         print(f"加载缓存失败: {e}")
                 
@@ -85,7 +88,7 @@ class ProcessingWorker(QThread):
                     calibration_source_paths = self.get_calibration_paths()
                     calibration_paths = self.prepare_readable_images(
                         calibration_source_paths,
-                        "批量转换校正 RAW",
+                        "正在转换校正图片",
                         progress_value=0,
                     )
                     vecs = []
@@ -110,8 +113,7 @@ class ProcessingWorker(QThread):
                     msg_B = f"【蓝色 (B)】: {file_names[idx_b]}\n   均值: R={vecs[0, idx_b]:.0f}, G={vecs[1, idx_b]:.0f}, B={vecs[2, idx_b]:.0f}"
                     full_msg = f"自动识别结果如下，请确认：\n\n{msg_R}\n\n{msg_G}\n\n{msg_B}"
                     
-                    # 阻塞并请求确认
-                    if not self._wait_for_user_choice("确认校正信息", full_msg):
+                    if self.confirm_calibration and not self._wait_for_user_choice("确认校正信息", full_msg):
                         if not self._is_cancelled:
                             self.finished_error.emit("用户取消处理")
                         return
@@ -124,7 +126,15 @@ class ProcessingWorker(QThread):
                     row_sums = M_inv.sum(axis=1, keepdims=True)
                     M_Final = M_inv / row_sums
                     
-                    np.save(matrix_path, M_Final)
+                    matrix_dir = os.path.dirname(self.matrix_path)
+                    if matrix_dir:
+                        os.makedirs(matrix_dir, exist_ok=True)
+                    np.save(self.matrix_path, M_Final)
+
+                if self.calibration_only:
+                    self.progress_updated.emit(100, "解耦矩阵计算完成")
+                    self.finished_success.emit(self.matrix_path)
+                    return
 
                 # --- Step 2: 批量处理 ---
                 self.progress_updated.emit(10, "步骤 2/4: 正在处理图片...")
@@ -133,7 +143,7 @@ class ProcessingWorker(QThread):
                 if total == 0: raise ValueError("未选择输入文件")
                 readable_inputs = self.prepare_readable_images(
                     self.input_files,
-                    "批量转换输入 RAW",
+                    "正在转换输入图片",
                     progress_value=10,
                 )
 
@@ -171,22 +181,7 @@ class ProcessingWorker(QThread):
             self.finished_error.emit(str(e))
 
     def get_calibration_paths(self):
-        all_files = [
-            os.path.join(self.dir_rgb, f)
-            for f in os.listdir(self.dir_rgb)
-            if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
-        ]
-        tiff_files = sorted([p for p in all_files if os.path.splitext(p)[1].lower() in TIFF_EXTENSIONS])
-        raw_files = sorted([p for p in all_files if os.path.splitext(p)[1].lower() in RAW_EXTENSIONS])
-
-        if len(tiff_files) == 3:
-            return tiff_files
-        if len(raw_files) == 3:
-            return raw_files
-        raise ValueError(
-            "RGB 文件夹必须包含且仅包含 3 张 TIFF 校正图片，或 3 张 RAW 校正图片；"
-            f"当前找到 TIFF {len(tiff_files)} 张，RAW {len(raw_files)} 张"
-        )
+        return validate_rgb_calibration_files(self.rgb_files)
 
     def prepare_readable_images(self, paths, status_message, progress_value=0):
         raw_paths = [path for path in paths if is_raw_path(path)]
